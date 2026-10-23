@@ -3,15 +3,18 @@
 
 //! Backend-neutral crypto operations and library-specific protocol adapters.
 //!
-//! AWS-LC is the only production implementation in this first stage. This crate
+//! AWS-LC is the default; an opt-in system-OpenSSL backend supports explicit selection. This crate
 //! does not enable FIPS mode, change algorithms, or attest dependency-owned crypto.
-//! The extension target is a system-OpenSSL backend for regulated deployments
-//! (<https://github.com/NVIDIA/OpenShell/issues/900>). See the crate README for
+//! See the crate README for
 //! initialization, key ownership, and dependency coverage boundaries.
 
 pub mod aead;
 #[cfg(feature = "aws-lc")]
 mod aws_lc;
+#[cfg(feature = "openssl")]
+mod openssl_backend;
+#[cfg(feature = "openssl")]
+pub use openssl_backend::OpenSsl;
 pub mod jwt;
 pub mod pki;
 pub mod tls;

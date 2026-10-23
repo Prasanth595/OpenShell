@@ -171,10 +171,12 @@ fn selected_context_controls_application_adapters_and_cannot_be_replaced() {
     .unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
-    let client = openshell_crypto::tls::client_builder()
+    let client = openshell_crypto::tls::try_client_builder()
+        .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server = openshell_crypto::tls::server_builder()
+    let server = openshell_crypto::tls::try_server_builder()
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.der().clone()],
