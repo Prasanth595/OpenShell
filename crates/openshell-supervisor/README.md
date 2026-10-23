@@ -157,10 +157,13 @@ control listener: it dials the gateway and receives its assignments from it.
   omits. An identical assignment is a no-op; one that cannot be admitted
   (invalid material, or a different fingerprint for a live route) is reported
   as a failed instance and never touches the running one. Snapshots are
-  reconciled one at a time on a separate task, so heartbeats and status keep
-  flowing while instances stop; only the newest unapplied snapshot is kept,
-  and a connection finishes the reconciliation it started before the next
-  connection begins. Private files live under `--session-root` (proxy CA,
+  reconciled one at a time by one worker that outlives connections, so
+  heartbeats and status keep flowing while instances start or stop, and a
+  lost connection is replaced without waiting for a slow reconciliation; only
+  the newest unapplied snapshot is kept, and work queued by an older
+  connection is dropped when a new one begins. On shutdown the worker drops
+  queued work and finishes the reconciliation in flight before the host
+  releases or removes its instances. Private files live under `--session-root` (proxy CA,
   trust directory, SSH socket); the registry owns removal and keeps the route
   reserved until the instance has ended and its files are deleted.
 - **Status.** After each reconciliation and whenever an instance is admitted,
@@ -170,14 +173,43 @@ control listener: it dials the gateway and receives its assignments from it.
 - **Disconnects.** Losing the gateway stream never stops an instance. The
   host reconnects with backoff, reports what it runs, and applies the first
   snapshot of the new session; only a snapshot that omits an instance, or
-  process shutdown, stops it.
+  process shutdown, stops it. A pool member uses the timings of
+  `openshell_supervisor_control::pool_timing`: it abandons a stream after 3 s
+  without hearing from the gateway, bounds sends by the same silence, gives
+  each early reconnect attempt one 1 s deadline across connecting, attaching,
+  and being accepted, and backs off 100 to 400 ms with jitter, so it reaches a
+  responsive gateway replica well before its membership record expires. A
+  lone shared supervisor keeps its longer timings.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
   instance's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.
 - **Health.** `--address` is a plain TCP listener that accepts and closes
   kubelet `tcpSocket` probe connections; it carries no control traffic and
-  reports only that the process runs. SIGTERM and SIGINT stop every instance,
-  which ends their workloads' supervision.
+  reports only that the process runs. SIGTERM and SIGINT stop every instance
+  of a lone shared supervisor, which ends their workloads' supervision.
+- **Pool members.** `--pool-member-id`, `--pool-member-uid`, and
+  `--pool-advertise-ip` (or `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
+  `_MEMBER_UID`, `_ADVERTISE_IP`, which the chart fills from the Pod's name,
+  UID, and IP) make the process a member of a high-availability pool; its
+  hello names the member and its runtime address. A pool snapshot lists only
+  the instances this process owns. An instance it omits moved to another
+  member and is **relinquished**: the instance is cancelled without its stop
+  path, so the runtime keeps the workload frozen until the new owner takes
+  it over. Only `stop_routes` are stopped, and `keep_routes` are left as
+  they are. A pool instance's admission fingerprint is its launch material
+  and ownership term, not its credentials, so the same term re-minted by
+  another gateway replica keeps the running instance. A takeover term
+  replaces the launch credentials with the term's and attaches with its
+  grant; the replacement adopts the running workload instead of starting it
+  and keeps the launch material's proxy CA and SSH host key. A term that
+  arrives without credentials, or whose route is still being released, is
+  deferred, reported as starting, and retried at the heartbeat cadence. The
+  host follows the gateway's heartbeat interval, offers each instance's
+  runtime the recovery deadline of the latest snapshot
+  (`recovery_timeout_secs`) when it attaches, feeds the route directory to the
+  runtime router for redirects, and on SIGTERM announces that it is
+  leaving, waits up to 40 seconds for the gateway to move its instances, and
+  relinquishes what remains.
 
 Sandbox instances get no upstream proxy, extra CA bundle, or provider workload identity:
 the Kubernetes driver refuses the topology when an upstream proxy or provider

@@ -20,12 +20,25 @@
 //! before the records were listed, so a list that raced a lifecycle edit
 //! never resurrects a withdrawn instance or discards a new one.
 //!
-//! Exactly one host serves a gateway: a new attach from a newer connection of
-//! the same host process, or from a new host process, supersedes the current
-//! session; reports and acks from a superseded stream are dropped, and a
-//! delayed hello from an older connection of the current process is refused.
+//! Without a pool, exactly one host serves a gateway: a new attach from a
+//! newer connection of the same host process, or from a new host process,
+//! supersedes the current session; reports and acks from a superseded stream
+//! are dropped, and a delayed hello from an older connection of the current
+//! process is refused.
+//!
+//! With a supervisor pool (high availability) the same rules apply per pool
+//! member, and several members are served at once. The pool's desired set,
+//! the durable owner of every instance (a member's process and an ownership
+//! term), and the latest reports of owners served by other gateway replicas
+//! come from the gateway's durable records through [`PoolView`], on every
+//! gateway replica alike; each member is sent only the instances its current
+//! process owns, with the credentials of their term. A pool member releases,
+//! without stopping, an instance a snapshot omits; only withdrawn instances
+//! are listed for stopping. Nothing is sent to pool members until the first
+//! view has been loaded, so a restarted gateway never releases running
+//! instances.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,25 +49,45 @@ use tonic::{Status, Streaming};
 
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
-    HostMessage, HostStatus, SandboxInstanceAssignment, SandboxInstanceStatus,
-    host_gateway_message, host_message,
+    HostMessage, HostStatus, PoolMember, RouteOwner, SandboxInstanceAssignment,
+    SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
+
+/// Recovery deadline a supervisor pool offers each sandbox runtime.
+///
+/// Membership expiry, one reconciliation pass, and a replacement instance's
+/// startup fit with room to spare. The gateway may configure another; without
+/// a pool the runtime keeps its own default.
+pub const POOL_RECOVERY_TIMEOUT_SECS: u32 = 60;
 
 /// Interval at which both ends send heartbeats on an idle stream.
 pub const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Heartbeat interval of pool members, whose liveness drives failover.
+pub const POOL_HEARTBEAT_INTERVAL: Duration = crate::pool_timing::HEARTBEAT_INTERVAL;
 /// Silence after which the gateway closes a host stream.
 const HOST_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Silence after which the gateway closes a pool member's stream.
+const POOL_SILENCE_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Bound on the host sending its hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on queueing one gateway-to-host message; a host that cannot drain
 /// its stream this long is disconnected rather than stalling the session.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// [`SEND_TIMEOUT`] for pool members, whose served stream keeps their
+/// membership record alive: a member that stops reading is dropped as soon as
+/// one that stops writing.
+const POOL_SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Gateway-to-host messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
+/// How long a withdrawn pool instance stays on its owner's stop list.
+const POOL_STOP_RETENTION: Duration = Duration::from_mins(2);
 /// Most sandbox instances one shared supervisor host runs. The gateway
 /// refuses to assign beyond it, and the host refuses snapshots beyond it, so
 /// a sandbox is never created that its host could not accept.
 pub const MAX_ASSIGNED_INSTANCES: usize = 256;
+/// Most sandbox instances a supervisor pool runs across its members; the
+/// gateway places at most [`MAX_ASSIGNED_INSTANCES`] on each member.
+pub const MAX_POOL_INSTANCES: usize = 16 * MAX_ASSIGNED_INSTANCES;
 /// Most instances one host status report may describe: every assignment plus
 /// instances still being removed.
 pub const MAX_REPORTED_INSTANCES: usize = 4 * MAX_ASSIGNED_INSTANCES;
@@ -86,7 +119,8 @@ pub struct SupervisorCredential {
 /// What the gateway knows about one assigned route on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservedInstance {
-    /// No host session is connected.
+    /// No host session is connected (for a pool: the owner's process is not
+    /// connected to this gateway, or the route has no owner yet).
     NoHost,
     /// A host is connected but has not reconciled to the snapshot that
     /// assigned this route.
@@ -96,6 +130,118 @@ pub enum ObservedInstance {
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
+}
+
+/// The process and ownership term that supervise one pool instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceOwner {
+    /// Pool member that owns the instance.
+    pub member_id: String,
+    /// Host process of that member that owns the term.
+    pub process_id: String,
+    /// Ownership term: the sandbox credential epoch of the owner.
+    pub auth_epoch: u64,
+    /// Supervisor process identity a term after the launch term was granted
+    /// for; absent for the launch term.
+    pub supervisor_instance_id: Option<String>,
+    /// Credentials of a term after the launch term, for the owner's host.
+    /// Absent for the launch term, whose credentials the launch material
+    /// carries. Minted by this gateway only for members it serves.
+    pub takeover: Option<SandboxInstanceTakeover>,
+}
+
+impl InstanceOwner {
+    /// The takeover term an assignment carries: with its credentials when
+    /// this gateway minted them, else the term alone, so a host already
+    /// running the instance for that term keeps it. Credentials minted for
+    /// one term differ between gateway replicas; the term does not.
+    fn takeover_term(&self) -> Option<SandboxInstanceTakeover> {
+        let supervisor_instance_id = self.supervisor_instance_id.as_ref()?;
+        Some(
+            self.takeover
+                .clone()
+                .unwrap_or_else(|| SandboxInstanceTakeover {
+                    auth_epoch: self.auth_epoch,
+                    supervisor_instance_id: supervisor_instance_id.clone(),
+                    ..SandboxInstanceTakeover::default()
+                }),
+        )
+    }
+}
+
+/// A live pool member as the gateway's durable membership records show it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberView {
+    pub member_id: String,
+    /// Host process currently serving the member.
+    pub process_id: String,
+    /// Routed runtime listener address of the member.
+    pub runtime_address: String,
+    /// The member announced it is leaving the pool.
+    pub leaving: bool,
+}
+
+/// The gateway's durable view of a supervisor pool, replaced as a whole by
+/// the gateway's pool reconciler on every replica.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PoolView {
+    pub members: Vec<MemberView>,
+    /// Owner of each placed route.
+    pub owners: BTreeMap<String, InstanceOwner>,
+    /// Every route the pool must run, from the gateway's durable records. An
+    /// owned route that is not desired was withdrawn.
+    pub desired: BTreeSet<String>,
+    /// Assignments, launch material included, this gateway replica loaded
+    /// for routes its members own. An owned desired route missing here is
+    /// kept by its owner as it is.
+    pub assignments: BTreeMap<String, SandboxInstanceAssignment>,
+    /// Latest report of each route's current owner term, recorded by the
+    /// gateway replica that serves the owner, for judging instances whose
+    /// owner streams to another replica.
+    pub reports: BTreeMap<String, SandboxInstanceStatus>,
+}
+
+impl std::fmt::Debug for PoolView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PoolView")
+            .field("members", &self.members)
+            .field("owners", &self.owners)
+            .field("desired", &self.desired)
+            .field("assignments", &self.assignments.keys().collect::<Vec<_>>())
+            .field("reports", &self.reports.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// What a pool member's stream served here last reported of one instance,
+/// for the gateway to record durably under the ownership term it belongs to,
+/// so other replicas can judge the instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberReport {
+    pub member_id: String,
+    pub process_id: String,
+    /// Ownership term the reporting stream had applied for the route when it
+    /// reported: the term of the snapshot that last installed the route on
+    /// the stream, once the stream acknowledged it.
+    pub auth_epoch: u64,
+    /// When the reporting stream was accepted (Unix milliseconds).
+    pub connected_at_ms: i64,
+    pub status: SandboxInstanceStatus,
+}
+
+/// A connected pool member's stream, for the gateway's membership records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectedMember {
+    pub member_id: String,
+    pub member_uid: String,
+    pub process_id: String,
+    pub runtime_address: String,
+    /// The member reported that it is leaving.
+    pub leaving: bool,
+    /// When this stream was accepted (Unix milliseconds); a newer stream of a
+    /// member supersedes an older one on another gateway replica.
+    pub connected_at_ms: i64,
 }
 
 struct Assigned {
@@ -111,20 +257,12 @@ struct Desired {
     assignments: BTreeMap<String, Assigned>,
     /// Edits made before initialization, applied over the first full list.
     pending: BTreeMap<String, Option<SandboxInstanceAssignment>>,
+    /// Pool only: withdrawn instances to stop, with the owner and the time of
+    /// withdrawal.
+    stopping: BTreeMap<String, (InstanceOwner, tokio::time::Instant)>,
 }
 
 impl Desired {
-    fn snapshot(&self) -> Option<AssignmentSnapshot> {
-        self.initialized.then(|| AssignmentSnapshot {
-            revision: self.revision,
-            instances: self
-                .assignments
-                .values()
-                .map(|assigned| assigned.assignment.clone())
-                .collect(),
-        })
-    }
-
     /// Insert or replace one assignment; returns whether anything changed.
     fn put(&mut self, assignment: SandboxInstanceAssignment, revision: u64) -> bool {
         match self.assignments.get(&assignment.route) {
@@ -143,36 +281,99 @@ impl Desired {
     }
 }
 
+/// Pool state: the durable view and when each owner term was first recorded
+/// here, for telling a reconciling host from one that dropped an instance.
+struct Pool {
+    loaded: bool,
+    view: PoolView,
+    owned_since: BTreeMap<String, u64>,
+    /// Owners placed by launches on this gateway, with when, so a view whose
+    /// records were listed before a placement does not drop it.
+    placed: BTreeMap<String, (InstanceOwner, tokio::time::Instant)>,
+    /// Instances launched through this gateway, with when, kept over views
+    /// listed before them.
+    launched: BTreeMap<String, tokio::time::Instant>,
+    /// Instances withdrawn here whose durable records the gateway has not
+    /// removed yet; they are not desired whatever a view says.
+    withdrawals: BTreeSet<String>,
+    /// Recovery deadline offered to every instance's runtime.
+    recovery_timeout_secs: u32,
+}
+
+impl Pool {
+    fn new(recovery_timeout_secs: u32) -> Self {
+        Self {
+            loaded: false,
+            view: PoolView::default(),
+            owned_since: BTreeMap::new(),
+            placed: BTreeMap::new(),
+            launched: BTreeMap::new(),
+            withdrawals: BTreeSet::new(),
+            recovery_timeout_secs,
+        }
+    }
+}
+
 struct HostSession {
     id: u64,
     identity: HostIdentity,
     instance_id: String,
     connection_epoch: u64,
+    member: Option<PoolMember>,
     superseded: watch::Sender<bool>,
     /// Highest snapshot revision sent on this stream; acks beyond it are
     /// impossible and rejected.
     sent_revision: u64,
+    /// Latest report of this session.
+    status: Option<HostStatus>,
+    connected_at_ms: i64,
+    /// Ownership term of each route the snapshots sent on this stream assign
+    /// or keep, with the revision that first installed that term.
+    terms: BTreeMap<String, (u64, u64)>,
+    /// Terms of the last snapshot built for this stream, committed to
+    /// `terms` once that snapshot is sent.
+    pending_terms: Option<PendingTerms>,
+}
+
+/// Terms of one snapshot: the revision, the routes it assigns, and the routes
+/// it keeps as they are.
+struct PendingTerms {
+    revision: u64,
+    assigned: BTreeMap<String, u64>,
+    kept: BTreeMap<String, u64>,
+}
+
+impl HostSession {
+    fn member_id(&self) -> Option<&str> {
+        self.member.as_ref().map(|member| member.member_id.as_str())
+    }
 }
 
 #[derive(Default)]
 struct Observed {
-    session: Option<HostSession>,
-    /// Latest report of the current session.
-    status: Option<HostStatus>,
+    sessions: BTreeMap<u64, HostSession>,
     next_session: u64,
 }
 
 struct Inner {
     desired: Mutex<Desired>,
+    /// Present when the host is a supervisor pool.
+    pool: Mutex<Option<Pool>>,
+    /// The gateway's durable placement of new pool instances.
+    placement: Mutex<Option<Arc<dyn crate::coordinator::InstancePlacement>>>,
     /// Latest supervisor token the gateway minted; `None` until the first.
     credential: watch::Sender<Option<SupervisorCredential>>,
-    /// Current desired revision; 0 while uninitialized.
+    /// Current revision of everything snapshots are derived from; 0 while
+    /// uninitialized.
     revision: watch::Sender<u64>,
+    /// Counts changes to the pool members this gateway serves: a member
+    /// stream attached or ended, or a member announced leaving.
+    membership: watch::Sender<u64>,
     observed: Mutex<Observed>,
 }
 
-/// Gateway-owned desired assignments and observed status of one shared
-/// supervisor host.
+/// Gateway-owned desired assignments and observed status of a shared
+/// supervisor host or pool.
 #[derive(Clone)]
 pub struct SupervisorHostController {
     inner: Arc<Inner>,
@@ -201,7 +402,7 @@ pub enum AssignmentError {
     #[error("desired assignments changed from revision {baseline} to {current} during the resync")]
     Conflict { baseline: u64, current: u64 },
     /// The change would assign more instances than one host runs.
-    #[error("the shared supervisor hosts at most {MAX_ASSIGNED_INSTANCES} sandbox instances")]
+    #[error("the shared supervisor has no capacity for another sandbox instance")]
     Capacity,
 }
 
@@ -217,11 +418,41 @@ impl SupervisorHostController {
         Self {
             inner: Arc::new(Inner {
                 desired: Mutex::new(Desired::default()),
+                pool: Mutex::new(None),
+                placement: Mutex::new(None),
                 credential: watch::Sender::new(None),
                 revision: watch::Sender::new(0),
+                membership: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
             }),
         }
+    }
+
+    /// Serve a supervisor pool instead of a single host, offering every
+    /// instance's runtime `recovery_timeout_secs`. Must be called before any
+    /// host attaches.
+    pub fn enable_pool(&self, recovery_timeout_secs: u32) {
+        let mut pool = lock(&self.inner.pool);
+        if pool.is_none() {
+            *pool = Some(Pool::new(recovery_timeout_secs));
+        }
+    }
+
+    /// Whether this controller serves a supervisor pool.
+    #[must_use]
+    pub fn is_pool(&self) -> bool {
+        lock(&self.inner.pool).is_some()
+    }
+
+    /// Install the gateway's durable placement of new pool instances.
+    pub fn install_placement(&self, placement: Arc<dyn crate::coordinator::InstancePlacement>) {
+        *lock(&self.inner.placement) = Some(placement);
+    }
+
+    /// The installed placement of new pool instances.
+    #[must_use]
+    pub fn placement(&self) -> Option<Arc<dyn crate::coordinator::InstancePlacement>> {
+        lock(&self.inner.placement).clone()
     }
 
     /// Publish a freshly minted supervisor token for delivery to the host.
@@ -260,6 +491,45 @@ impl SupervisorHostController {
             .map(|assigned| assigned.assignment.clone())
     }
 
+    /// Every current assignment.
+    #[must_use]
+    pub fn assignments(&self) -> Vec<SandboxInstanceAssignment> {
+        lock(&self.inner.desired)
+            .assignments
+            .values()
+            .map(|assigned| assigned.assignment.clone())
+            .collect()
+    }
+
+    /// Most instances the desired set may hold: one host's, or a pool's.
+    fn capacity(&self) -> usize {
+        if self.is_pool() {
+            MAX_POOL_INSTANCES
+        } else {
+            MAX_ASSIGNED_INSTANCES
+        }
+    }
+
+    fn bump(&self, desired: &mut Desired) -> u64 {
+        desired.revision += 1;
+        self.inner.revision.send_replace(desired.revision);
+        desired.revision
+    }
+
+    /// Record withdrawn pool instances for their owner to stop.
+    fn record_stops(&self, desired: &mut Desired, routes: impl IntoIterator<Item = String>) {
+        let pool = lock(&self.inner.pool);
+        let Some(pool) = pool.as_ref() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        for route in routes {
+            if let Some(owner) = pool.view.owners.get(&route) {
+                desired.stopping.insert(route, (owner.clone(), now));
+            }
+        }
+    }
+
     /// Replace the whole desired set with `assignments`, derived from
     /// durable records while the revision was `baseline`.
     ///
@@ -286,31 +556,43 @@ impl SupervisorHostController {
         for assignment in assignments {
             resolved.insert(assignment.route.clone(), assignment);
         }
+        let mut withdrawn = Vec::new();
         for (route, edit) in &desired.pending {
-            match edit {
-                Some(assignment) => {
-                    resolved.insert(route.clone(), assignment.clone());
-                }
-                None => {
-                    resolved.remove(route);
-                }
+            if let Some(assignment) = edit {
+                resolved.insert(route.clone(), assignment.clone());
+            } else {
+                resolved.remove(route);
+                withdrawn.push(route.clone());
             }
         }
-        if resolved.len() > MAX_ASSIGNED_INSTANCES {
+        if resolved.len() > self.capacity() {
             return Err(AssignmentError::Capacity);
         }
         desired.pending.clear();
+        // A route the list assigns is not being stopped, whatever an earlier
+        // withdrawal recorded.
+        desired
+            .stopping
+            .retain(|route, _| !resolved.contains_key(route));
         let next = desired.revision + 1;
         let mut changed = !desired.initialized;
         for assignment in resolved.values() {
             changed |= desired.put(assignment.clone(), next);
         }
+        withdrawn.extend(
+            desired
+                .assignments
+                .keys()
+                .filter(|route| !resolved.contains_key(*route))
+                .cloned(),
+        );
         let before = desired.assignments.len();
         desired
             .assignments
             .retain(|route, _| resolved.contains_key(route));
         changed |= desired.assignments.len() != before;
         desired.initialized = true;
+        self.record_stops(&mut desired, withdrawn);
         if changed {
             desired.revision = next;
             self.inner.revision.send_replace(next);
@@ -320,9 +602,33 @@ impl SupervisorHostController {
 
     /// Assign one instance. Before initialization the edit is kept until the
     /// first full list arrives. Refused when it would exceed the host's
-    /// capacity, so the caller fails its create before anything runs.
+    /// capacity, so the caller fails its create before anything runs. In a
+    /// pool the instance is served at once and kept over views listed before
+    /// it; its durable record makes it desired on every gateway replica.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
         let mut desired = lock(&self.inner.desired);
+        {
+            let mut pool_guard = lock(&self.inner.pool);
+            if let Some(pool) = pool_guard.as_mut() {
+                if !desired.assignments.contains_key(&assignment.route)
+                    && desired.assignments.len() >= MAX_POOL_INSTANCES
+                {
+                    return Err(AssignmentError::Capacity);
+                }
+                pool.launched
+                    .insert(assignment.route.clone(), tokio::time::Instant::now());
+                pool.withdrawals.remove(&assignment.route);
+                pool.view.desired.insert(assignment.route.clone());
+                drop(pool_guard);
+                let next = desired.revision + 1;
+                desired.stopping.remove(&assignment.route);
+                if desired.put(assignment, next) {
+                    desired.revision = next;
+                    self.inner.revision.send_replace(next);
+                }
+                return Ok(());
+            }
+        }
         if !desired.initialized {
             let pending_additions = desired
                 .pending
@@ -330,7 +636,7 @@ impl SupervisorHostController {
                 .filter(|edit| edit.is_some())
                 .count();
             if !desired.pending.contains_key(&assignment.route)
-                && pending_additions >= MAX_ASSIGNED_INSTANCES
+                && pending_additions >= self.capacity()
             {
                 return Err(AssignmentError::Capacity);
             }
@@ -340,11 +646,12 @@ impl SupervisorHostController {
             return Ok(());
         }
         if !desired.assignments.contains_key(&assignment.route)
-            && desired.assignments.len() >= MAX_ASSIGNED_INSTANCES
+            && desired.assignments.len() >= self.capacity()
         {
             return Err(AssignmentError::Capacity);
         }
         let next = desired.revision + 1;
+        desired.stopping.remove(&assignment.route);
         if desired.put(assignment, next) {
             desired.revision = next;
             self.inner.revision.send_replace(next);
@@ -352,35 +659,330 @@ impl SupervisorHostController {
         Ok(())
     }
 
-    /// Withdraw one instance so the host stops it.
+    /// Withdraw one instance so the host stops it. In a pool the withdrawal
+    /// is also listed for the gateway to remove the instance's durable
+    /// record (see [`Self::pool_withdrawals`]).
     pub fn unassign(&self, route: &str) {
         let mut desired = lock(&self.inner.desired);
+        {
+            let mut pool_guard = lock(&self.inner.pool);
+            if let Some(pool) = pool_guard.as_mut() {
+                pool.launched.remove(route);
+                pool.withdrawals.insert(route.to_string());
+                pool.view.desired.remove(route);
+                let owner = pool.view.owners.get(route).cloned();
+                drop(pool_guard);
+                let removed = desired.assignments.remove(route).is_some();
+                if let Some(owner) = &owner {
+                    desired.stopping.insert(
+                        route.to_string(),
+                        (owner.clone(), tokio::time::Instant::now()),
+                    );
+                }
+                if removed || owner.is_some() {
+                    self.bump(&mut desired);
+                }
+                return;
+            }
+        }
         if !desired.initialized {
             desired.pending.insert(route.to_string(), None);
             return;
         }
         if desired.assignments.remove(route).is_some() {
-            desired.revision += 1;
-            let revision = desired.revision;
-            self.inner.revision.send_replace(revision);
+            self.record_stops(&mut desired, [route.to_string()]);
+            self.bump(&mut desired);
         }
+    }
+
+    /// Replace the durable pool view, derived from records listed at
+    /// `listed_at`; the view's loaded assignments become the desired
+    /// assignments this gateway serves. Owners placed and instances launched
+    /// here since then are kept until a view includes them, and instances
+    /// withdrawn here stay withdrawn until their records are gone. An owned
+    /// instance that leaves the desired set is listed for its owner to stop.
+    /// Owners whose term is new to this gateway are recorded as assigned at
+    /// the next revision, so their host is considered reconciling until it
+    /// acknowledges it.
+    pub fn update_pool(&self, mut view: PoolView, listed_at: tokio::time::Instant) {
+        let mut desired = lock(&self.inner.desired);
+        let mut pool_guard = lock(&self.inner.pool);
+        let Some(pool) = pool_guard.as_mut() else {
+            return;
+        };
+        pool.placed
+            .retain(|_, (_, placed_at)| *placed_at >= listed_at);
+        for (route, (owner, _)) in &pool.placed {
+            view.owners
+                .entry(route.clone())
+                .or_insert_with(|| owner.clone());
+        }
+        pool.launched
+            .retain(|_, launched_at| *launched_at >= listed_at);
+        for route in pool.launched.keys() {
+            view.desired.insert(route.clone());
+            if let Some(assigned) = desired.assignments.get(route) {
+                view.assignments
+                    .entry(route.clone())
+                    .or_insert_with(|| assigned.assignment.clone());
+            }
+        }
+        for route in &pool.withdrawals {
+            view.desired.remove(route);
+            view.assignments.remove(route);
+        }
+        let now = tokio::time::Instant::now();
+        let stopping_before = desired.stopping.len();
+        if pool.loaded {
+            for route in pool.view.desired.difference(&view.desired) {
+                if let Some(owner) = pool.view.owners.get(route) {
+                    desired
+                        .stopping
+                        .entry(route.clone())
+                        .or_insert_with(|| (owner.clone(), now));
+                }
+            }
+        }
+        // A desired route is not being stopped, whatever an earlier
+        // withdrawal recorded.
+        desired
+            .stopping
+            .retain(|route, _| !view.desired.contains(route));
+        let stops_changed = desired.stopping.len() != stopping_before;
+        if pool.loaded && desired.initialized && pool.view == view && !stops_changed {
+            return;
+        }
+        let next = desired.revision + 1;
+        let previous = std::mem::take(&mut pool.owned_since);
+        for (route, owner) in &view.owners {
+            let unchanged = pool.view.owners.get(route).is_some_and(|current| {
+                current.member_id == owner.member_id
+                    && current.process_id == owner.process_id
+                    && current.auth_epoch == owner.auth_epoch
+            });
+            let since = previous
+                .get(route)
+                .copied()
+                .filter(|_| unchanged)
+                .unwrap_or(next);
+            pool.owned_since.insert(route.clone(), since);
+        }
+        let assignments = view
+            .assignments
+            .iter()
+            .map(|(route, assignment)| {
+                let revision = desired
+                    .assignments
+                    .get(route)
+                    .filter(|assigned| assigned.assignment == *assignment)
+                    .map_or(next, |assigned| assigned.revision);
+                (
+                    route.clone(),
+                    Assigned {
+                        assignment: assignment.clone(),
+                        revision,
+                    },
+                )
+            })
+            .collect();
+        desired.assignments = assignments;
+        desired.initialized = true;
+        pool.view = view;
+        pool.loaded = true;
+        drop(pool_guard);
+        desired.revision = next;
+        self.inner.revision.send_replace(next);
+    }
+
+    /// Routes withdrawn here whose durable records the gateway still has to
+    /// remove; see [`Self::forget_withdrawal`].
+    #[must_use]
+    pub fn pool_withdrawals(&self) -> Vec<String> {
+        lock(&self.inner.pool)
+            .as_ref()
+            .map(|pool| pool.withdrawals.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The durable record of a route withdrawn here is gone.
+    pub fn forget_withdrawal(&self, route: &str) {
+        if let Some(pool) = lock(&self.inner.pool).as_mut() {
+            pool.withdrawals.remove(route);
+        }
+    }
+
+    /// Recovery deadline a pool offers each instance's runtime; `None`
+    /// without a pool.
+    #[must_use]
+    pub fn pool_recovery_timeout_secs(&self) -> Option<u32> {
+        lock(&self.inner.pool)
+            .as_ref()
+            .map(|pool| pool.recovery_timeout_secs)
+    }
+
+    /// What the pool members served here last reported of their instances.
+    /// The caller attributes each report to the owner term its own records
+    /// show, and drops reports of routes the reporting process does not own.
+    #[must_use]
+    pub fn member_reports(&self) -> Vec<MemberReport> {
+        if !self.is_pool() {
+            return Vec::new();
+        }
+        let observed = lock(&self.inner.observed);
+        let mut reports = Vec::new();
+        for session in observed.sessions.values() {
+            let (Some(member_id), Some(status)) = (session.member_id(), &session.status) else {
+                continue;
+            };
+            // A report counts only for a term the stream acknowledged; a
+            // status from before the term's snapshot describes an earlier
+            // term, even from the same process.
+            reports.extend(status.instances.iter().filter_map(|instance| {
+                let (auth_epoch, since) = session.terms.get(&instance.route)?;
+                (status.applied_revision >= *since).then(|| MemberReport {
+                    member_id: member_id.to_string(),
+                    process_id: session.instance_id.clone(),
+                    auth_epoch: *auth_epoch,
+                    connected_at_ms: session.connected_at_ms,
+                    status: instance.clone(),
+                })
+            }));
+        }
+        reports
+    }
+
+    /// Pool routes withdrawn for stopping; they must not be placed or taken
+    /// over again.
+    #[must_use]
+    pub fn stopping_routes(&self) -> BTreeSet<String> {
+        let mut desired = lock(&self.inner.desired);
+        let now = tokio::time::Instant::now();
+        desired
+            .stopping
+            .retain(|_, (_, since)| now.duration_since(*since) < POOL_STOP_RETENTION);
+        desired.stopping.keys().cloned().collect()
+    }
+
+    /// Record a newly placed owner without waiting for the next pool
+    /// reconciliation, so a launched instance is served at once.
+    pub fn place_owner(&self, route: &str, owner: InstanceOwner) {
+        let mut desired = lock(&self.inner.desired);
+        let mut pool_guard = lock(&self.inner.pool);
+        let Some(pool) = pool_guard.as_mut() else {
+            return;
+        };
+        pool.placed.insert(
+            route.to_string(),
+            (owner.clone(), tokio::time::Instant::now()),
+        );
+        // Until the first load, the reconciler's view will include it.
+        if !pool.loaded || pool.view.owners.get(route) == Some(&owner) {
+            return;
+        }
+        let next = desired.revision + 1;
+        pool.view.owners.insert(route.to_string(), owner);
+        pool.owned_since.insert(route.to_string(), next);
+        drop(pool_guard);
+        desired.revision = next;
+        self.inner.revision.send_replace(next);
+    }
+
+    /// The durable pool view this gateway serves, once loaded.
+    #[must_use]
+    pub fn pool_view(&self) -> Option<PoolView> {
+        lock(&self.inner.pool)
+            .as_ref()
+            .filter(|pool| pool.loaded)
+            .map(|pool| pool.view.clone())
+    }
+
+    /// Pool members whose streams this gateway serves, for its durable
+    /// membership records.
+    #[must_use]
+    pub fn connected_members(&self) -> Vec<ConnectedMember> {
+        lock(&self.inner.observed)
+            .sessions
+            .values()
+            .filter_map(|session| {
+                let member = session.member.as_ref()?;
+                Some(ConnectedMember {
+                    member_id: member.member_id.clone(),
+                    member_uid: member.member_uid.clone(),
+                    process_id: session.instance_id.clone(),
+                    runtime_address: member.runtime_address.clone(),
+                    leaving: session.status.as_ref().is_some_and(|status| status.leaving),
+                    connected_at_ms: session.connected_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Changes whenever [`Self::connected_members`] gains or loses a stream
+    /// or a member announces leaving, so membership records follow at once.
+    #[must_use]
+    pub fn membership_changes(&self) -> watch::Receiver<u64> {
+        self.inner.membership.subscribe()
+    }
+
+    fn membership_changed(&self) {
+        self.inner
+            .membership
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
     }
 
     /// Whether a host session is currently connected.
     #[must_use]
     pub fn host_connected(&self) -> bool {
-        lock(&self.inner.observed).session.is_some()
+        !lock(&self.inner.observed).sessions.is_empty()
     }
 
-    /// What the connected host reports for `route`.
+    /// What the connected host reports for `route`. For a pool, only the
+    /// session of the route's owning process renders a verdict.
     #[must_use]
     pub fn observed(&self, route: &str) -> ObservedInstance {
         let desired = lock(&self.inner.desired);
+        let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
-        if observed.session.is_none() {
-            return ObservedInstance::NoHost;
-        }
-        let Some(status) = &observed.status else {
+        let (session, assigned_revision) = match pool.as_ref() {
+            None => {
+                let Some(session) = observed.sessions.values().next() else {
+                    return ObservedInstance::NoHost;
+                };
+                (
+                    session,
+                    desired
+                        .assignments
+                        .get(route)
+                        .map(|assigned| assigned.revision),
+                )
+            }
+            Some(pool) => {
+                let Some(owner) = pool.view.owners.get(route) else {
+                    return ObservedInstance::NoHost;
+                };
+                let Some(session) = observed.sessions.values().find(|session| {
+                    session.member_id() == Some(owner.member_id.as_str())
+                        && session.instance_id == owner.process_id
+                }) else {
+                    // The owner streams to another gateway replica, which
+                    // records its reports for every replica.
+                    return pool
+                        .view
+                        .reports
+                        .get(route)
+                        .map_or(ObservedInstance::NoHost, |status| {
+                            ObservedInstance::Reported(status.clone())
+                        });
+                };
+                let assigned = desired
+                    .assignments
+                    .get(route)
+                    .map(|assigned| assigned.revision);
+                let since = pool.owned_since.get(route).copied();
+                (session, assigned.max(since))
+            }
+        };
+        let Some(status) = &session.status else {
             return ObservedInstance::Pending;
         };
         if let Some(instance) = status
@@ -390,16 +992,14 @@ impl SupervisorHostController {
         {
             return ObservedInstance::Reported(instance.clone());
         }
-        match desired.assignments.get(route) {
-            Some(assigned) if assigned.revision > status.applied_revision => {
-                ObservedInstance::Pending
-            }
+        match assigned_revision {
+            Some(revision) if revision > status.applied_revision => ObservedInstance::Pending,
             _ => ObservedInstance::Absent,
         }
     }
 
     /// Serve one authenticated host stream. Reads the hello, supersedes any
-    /// current session, and returns the gateway-to-host stream.
+    /// session it replaces, and returns the gateway-to-host stream.
     pub async fn attach(
         &self,
         identity: HostIdentity,
@@ -431,6 +1031,30 @@ impl SupervisorHostController {
                 "supervisor host hello names no instance",
             ));
         }
+        let pool = self.is_pool();
+        match (&hello.member, pool) {
+            (None, true) => {
+                return Err(Status::failed_precondition(
+                    "this gateway serves a supervisor pool; the host must name its pool member",
+                ));
+            }
+            (Some(_), false) => {
+                return Err(Status::failed_precondition(
+                    "this gateway serves a single shared supervisor, not a pool",
+                ));
+            }
+            (Some(member), true) if !valid_member(member) => {
+                return Err(Status::invalid_argument(
+                    "supervisor pool member identity is incomplete",
+                ));
+            }
+            _ => {}
+        }
+        let heartbeat = if pool {
+            POOL_HEARTBEAT_INTERVAL
+        } else {
+            HOST_HEARTBEAT_INTERVAL
+        };
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
@@ -438,7 +1062,7 @@ impl SupervisorHostController {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
                 session_id: session_id.to_string(),
                 heartbeat_interval: Some(prost_types::Duration {
-                    seconds: i64::try_from(HOST_HEARTBEAT_INTERVAL.as_secs()).unwrap_or(15),
+                    seconds: i64::try_from(heartbeat.as_secs()).unwrap_or(15),
                     nanos: 0,
                 }),
             })),
@@ -455,17 +1079,27 @@ impl SupervisorHostController {
         Ok(ReceiverStream::new(rx))
     }
 
-    /// Start a session for `hello`, superseding the current one. A hello from
-    /// the current host process with a connection epoch that is not newer is
-    /// a delayed or replayed connection and is refused.
+    /// Start a session for `hello`, superseding the session it replaces: the
+    /// only session without a pool, or the same member's session in a pool.
+    /// A hello from the current host process with a connection epoch that is
+    /// not newer is a delayed or replayed connection and is refused.
     fn begin_session(
         &self,
         identity: HostIdentity,
         hello: &HostHello,
     ) -> Result<(u64, watch::Receiver<bool>), Status> {
         let mut observed = lock(&self.inner.observed);
-        if let Some(current) = &observed.session
-            && current.instance_id == hello.instance_id
+        let member_id = hello.member.as_ref().map(|member| member.member_id.clone());
+        let replaced = observed
+            .sessions
+            .values()
+            .filter(|session| member_id.is_none() || session.member_id() == member_id.as_deref())
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if let Some(current) = replaced
+            .iter()
+            .filter_map(|id| observed.sessions.get(id))
+            .find(|session| session.instance_id == hello.instance_id)
             && hello.connection_epoch <= current.connection_epoch
         {
             return Err(Status::failed_precondition(
@@ -474,60 +1108,101 @@ impl SupervisorHostController {
         }
         observed.next_session += 1;
         let id = observed.next_session;
-        if let Some(previous) = observed.session.take() {
-            tracing::info!(
-                subject = %previous.identity.subject,
-                instance_id = %previous.instance_id,
-                connection_epoch = previous.connection_epoch,
-                "superseding supervisor host session"
-            );
-            previous.superseded.send_replace(true);
+        for previous in replaced {
+            if let Some(previous) = observed.sessions.remove(&previous) {
+                tracing::info!(
+                    subject = %previous.identity.subject,
+                    instance_id = %previous.instance_id,
+                    member = previous.member_id().unwrap_or_default(),
+                    connection_epoch = previous.connection_epoch,
+                    "superseding supervisor host session"
+                );
+                previous.superseded.send_replace(true);
+            }
         }
         tracing::info!(
             subject = %identity.subject,
             instance_id = %hello.instance_id,
+            member = member_id.as_deref().unwrap_or_default(),
             connection_epoch = hello.connection_epoch,
             session = id,
             "supervisor host attached"
         );
         let (superseded, watch) = watch::channel(false);
-        observed.session = Some(HostSession {
+        observed.sessions.insert(
             id,
-            identity,
-            instance_id: hello.instance_id.clone(),
-            connection_epoch: hello.connection_epoch,
-            superseded,
-            sent_revision: 0,
-        });
-        observed.status = None;
+            HostSession {
+                id,
+                identity,
+                instance_id: hello.instance_id.clone(),
+                connection_epoch: hello.connection_epoch,
+                member: hello.member.clone(),
+                superseded,
+                sent_revision: 0,
+                status: None,
+                connected_at_ms: unix_millis(),
+                terms: BTreeMap::new(),
+                pending_terms: None,
+            },
+        );
+        drop(observed);
+        if member_id.is_some() {
+            self.membership_changed();
+        }
         Ok((id, watch))
     }
 
     fn end_session(&self, id: u64) {
         let mut observed = lock(&self.inner.observed);
-        if observed
-            .session
-            .as_ref()
-            .is_some_and(|session| session.id == id)
-        {
-            let session = observed.session.take();
-            observed.status = None;
-            if let Some(session) = session {
-                tracing::info!(
-                    subject = %session.identity.subject,
-                    instance_id = %session.instance_id,
-                    session = id,
-                    "supervisor host detached; hosted instances keep running"
-                );
-            }
+        let Some(session) = observed.sessions.remove(&id) else {
+            return;
+        };
+        drop(observed);
+        tracing::info!(
+            subject = %session.identity.subject,
+            instance_id = %session.instance_id,
+            member = session.member_id().unwrap_or_default(),
+            session = id,
+            "supervisor host detached; hosted instances keep running"
+        );
+        if session.member.is_some() {
+            self.membership_changed();
         }
     }
 
-    /// Note that `revision` was sent on session `id`.
+    /// Note that `revision` was sent on session `id`. A route keeps the
+    /// revision that installed its term while snapshots repeat the term; a
+    /// new term is installed by `revision`; a kept route keeps only the term
+    /// it already had, and a route the snapshot omits has none.
     fn record_sent(&self, id: u64, revision: u64) {
         let mut observed = lock(&self.inner.observed);
-        if let Some(session) = observed.session.as_mut().filter(|session| session.id == id) {
+        if let Some(session) = observed.sessions.get_mut(&id) {
             session.sent_revision = session.sent_revision.max(revision);
+            if let Some(pending) = session
+                .pending_terms
+                .take()
+                .filter(|pending| pending.revision == revision)
+            {
+                let previous = std::mem::take(&mut session.terms);
+                let installed = |route: &String, epoch: u64| {
+                    previous
+                        .get(route)
+                        .filter(|(installed, _)| *installed == epoch)
+                        .map(|(_, since)| *since)
+                };
+                session.terms = pending
+                    .assigned
+                    .iter()
+                    .map(|(route, epoch)| {
+                        let since = installed(route, *epoch).unwrap_or(revision);
+                        (route.clone(), (*epoch, since))
+                    })
+                    .chain(pending.kept.iter().filter_map(|(route, epoch)| {
+                        let since = installed(route, *epoch)?;
+                        Some((route.clone(), (*epoch, since)))
+                    }))
+                    .collect();
+            }
         }
     }
 
@@ -536,7 +1211,7 @@ impl SupervisorHostController {
     /// oversized reports are dropped.
     fn record_status(&self, id: u64, status: HostStatus) -> Result<(), &'static str> {
         let mut observed = lock(&self.inner.observed);
-        let Some(session) = observed.session.as_ref().filter(|session| session.id == id) else {
+        let Some(session) = observed.sessions.get_mut(&id) else {
             return Err("report from a superseded supervisor host session");
         };
         if status.applied_revision > session.sent_revision {
@@ -545,19 +1220,146 @@ impl SupervisorHostController {
         if status.instances.len() > MAX_REPORTED_INSTANCES {
             return Err("supervisor host status reports too many instances");
         }
-        if observed
+        if session
             .status
             .as_ref()
             .is_some_and(|previous| status.applied_revision < previous.applied_revision)
         {
             return Err("supervisor host acknowledged an older revision than before");
         }
-        observed.status = Some(status);
+        let leaving = status.leaving
+            && !session
+                .status
+                .as_ref()
+                .is_some_and(|previous| previous.leaving);
+        session.status = Some(status);
+        drop(observed);
+        if leaving {
+            // Membership records follow the leaving flag at once.
+            self.membership_changed();
+            let mut desired = lock(&self.inner.desired);
+            self.bump(&mut desired);
+        }
         Ok(())
     }
 
-    fn snapshot(&self) -> Option<AssignmentSnapshot> {
-        lock(&self.inner.desired).snapshot()
+    /// The snapshot for session `id`: every desired instance for a single
+    /// host; for a pool member, the instances its process owns, the stop
+    /// list, and the route directory. `None` until it can be authoritative.
+    fn snapshot(&self, id: u64) -> Option<AssignmentSnapshot> {
+        let mut desired = lock(&self.inner.desired);
+        if !desired.initialized {
+            return None;
+        }
+        let pool = lock(&self.inner.pool);
+        let Some(pool) = pool.as_ref() else {
+            return Some(AssignmentSnapshot {
+                revision: desired.revision,
+                instances: desired
+                    .assignments
+                    .values()
+                    .map(|assigned| assigned.assignment.clone())
+                    .collect(),
+                ..AssignmentSnapshot::default()
+            });
+        };
+        if !pool.loaded {
+            return None;
+        }
+        let mut observed = lock(&self.inner.observed);
+        let session = observed.sessions.get_mut(&id)?;
+        let member_id = session.member_id()?.to_string();
+        let instance_id = session.instance_id.clone();
+        let owned_by_session =
+            |owner: &InstanceOwner| owner.member_id == member_id && owner.process_id == instance_id;
+        let mut assigned_terms = BTreeMap::new();
+        let instances = desired
+            .assignments
+            .values()
+            .filter_map(|assigned| {
+                let owner = pool.view.owners.get(&assigned.assignment.route)?;
+                owned_by_session(owner).then(|| {
+                    assigned_terms.insert(assigned.assignment.route.clone(), owner.auth_epoch);
+                    SandboxInstanceAssignment {
+                        takeover: owner.takeover_term(),
+                        ..assigned.assignment.clone()
+                    }
+                })
+            })
+            .collect();
+        let now = tokio::time::Instant::now();
+        desired
+            .stopping
+            .retain(|_, (_, since)| now.duration_since(*since) < POOL_STOP_RETENTION);
+        // Withdrawn here, or owned yet no longer desired anywhere.
+        let stop_routes = desired
+            .stopping
+            .iter()
+            .filter(|(_, (owner, _))| owner.member_id == *member_id)
+            .map(|(route, _)| route.clone())
+            .chain(
+                pool.view
+                    .owners
+                    .iter()
+                    .filter(|(route, owner)| {
+                        owner.member_id == *member_id
+                            && !pool.view.desired.contains(*route)
+                            && !desired.stopping.contains_key(*route)
+                    })
+                    .map(|(route, _)| route.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let addresses = pool
+            .view
+            .members
+            .iter()
+            .map(|member| (member.member_id.as_str(), member.runtime_address.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let route_directory = pool
+            .view
+            .owners
+            .iter()
+            .filter_map(|(route, owner)| {
+                Some(RouteOwner {
+                    route: route.clone(),
+                    runtime_address: (*addresses.get(owner.member_id.as_str())?).to_string(),
+                })
+            })
+            .collect();
+        // Owned desired instances whose launch material this gateway has not
+        // loaded yet are kept as they are rather than released.
+        let kept_terms = pool
+            .view
+            .owners
+            .iter()
+            .filter(|(route, owner)| {
+                owned_by_session(owner)
+                    && pool.view.desired.contains(*route)
+                    && !desired.assignments.contains_key(*route)
+                    && !desired.stopping.contains_key(*route)
+            })
+            .map(|(route, owner)| (route.clone(), owner.auth_epoch))
+            .collect::<BTreeMap<_, _>>();
+        let keep_routes = kept_terms.keys().cloned().collect();
+        session.pending_terms = Some(PendingTerms {
+            revision: desired.revision,
+            assigned: assigned_terms,
+            kept: kept_terms,
+        });
+        Some(AssignmentSnapshot {
+            revision: desired.revision,
+            instances,
+            pool: true,
+            stop_routes,
+            route_directory,
+            keep_routes,
+            recovery_timeout: Some(prost_types::Duration {
+                seconds: i64::from(pool.recovery_timeout_secs),
+                nanos: 0,
+            }),
+        })
     }
 
     async fn run_session(
@@ -573,10 +1375,20 @@ impl SupervisorHostController {
         // reconnects with the renewed token it has been delivered.
         let credential_expiry = tokio::time::sleep(credential_remaining(expires_at));
         tokio::pin!(credential_expiry);
+        let (heartbeat_interval, silence_timeout, send_timeout) = if self.is_pool() {
+            (
+                POOL_HEARTBEAT_INTERVAL,
+                POOL_SILENCE_TIMEOUT,
+                POOL_SEND_TIMEOUT,
+            )
+        } else {
+            (HOST_HEARTBEAT_INTERVAL, HOST_SILENCE_TIMEOUT, SEND_TIMEOUT)
+        };
         let mut revision = self.inner.revision.subscribe();
+        let mut last_snapshot: Option<AssignmentSnapshot> = None;
         let mut sent_revision = 0;
         let mut last_heard = tokio::time::Instant::now();
-        let mut heartbeat = tokio::time::interval(HOST_HEARTBEAT_INTERVAL);
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // A send that cannot complete within the bound ends the session, so a
         // stalled host can neither block supersession nor delay heartbeats.
@@ -587,7 +1399,7 @@ impl SupervisorHostController {
                     Ok(HostGatewayMessage {
                         payload: Some(message),
                     }),
-                    SEND_TIMEOUT,
+                    send_timeout,
                 )
                 .await
                 .is_ok()
@@ -595,21 +1407,32 @@ impl SupervisorHostController {
         };
         loop {
             let current = *revision.borrow_and_update();
-            if current > sent_revision {
-                let Some(snapshot) = self.snapshot() else {
-                    continue;
-                };
-                tracing::debug!(
-                    session = session_id,
-                    revision = snapshot.revision,
-                    instances = snapshot.instances.len(),
-                    "sending supervisor host assignment snapshot"
-                );
-                let revision_sent = snapshot.revision;
-                if !send(host_gateway_message::Payload::Assignments(snapshot)).await {
-                    return;
+            if current > sent_revision
+                && let Some(snapshot) = self.snapshot(session_id)
+            {
+                // Pool members are only sent snapshots that change something
+                // they act on.
+                let unchanged = last_snapshot.as_ref().is_some_and(|previous| {
+                    previous.pool
+                        && previous.instances == snapshot.instances
+                        && previous.stop_routes == snapshot.stop_routes
+                        && previous.route_directory == snapshot.route_directory
+                        && previous.keep_routes == snapshot.keep_routes
+                });
+                if !unchanged {
+                    tracing::debug!(
+                        session = session_id,
+                        revision = snapshot.revision,
+                        instances = snapshot.instances.len(),
+                        "sending supervisor host assignment snapshot"
+                    );
+                    let revision_sent = snapshot.revision;
+                    if !send(host_gateway_message::Payload::Assignments(snapshot.clone())).await {
+                        return;
+                    }
+                    self.record_sent(session_id, revision_sent);
+                    last_snapshot = Some(snapshot);
                 }
-                self.record_sent(session_id, revision_sent);
                 sent_revision = current;
             }
             tokio::select! {
@@ -634,7 +1457,7 @@ impl SupervisorHostController {
                                 Err(Status::invalid_argument(
                                     "unexpected message on supervisor host stream",
                                 )),
-                                SEND_TIMEOUT,
+                                send_timeout,
                             )
                             .await;
                         return;
@@ -646,7 +1469,7 @@ impl SupervisorHostController {
                     None => return,
                 },
                 _ = heartbeat.tick() => {
-                    if last_heard.elapsed() > HOST_SILENCE_TIMEOUT {
+                    if last_heard.elapsed() > silence_timeout {
                         tracing::warn!(session = session_id, "supervisor host stream went silent; closing it");
                         return;
                     }
@@ -662,6 +1485,26 @@ impl SupervisorHostController {
             }
         }
     }
+}
+
+fn valid_member(member: &PoolMember) -> bool {
+    let valid = |value: &str| {
+        !value.is_empty() && value.len() <= 253 && !value.chars().any(char::is_whitespace)
+    };
+    valid(&member.member_id)
+        && valid(&member.member_uid)
+        && member
+            .runtime_address
+            .parse::<std::net::SocketAddr>()
+            .is_ok()
+}
+
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Time until `expires_at` (Unix seconds); zero once it has passed.
@@ -684,11 +1527,13 @@ mod tests {
             sandbox_id: format!("sandbox-{route}"),
             generation: "gen".to_string(),
             launch_material: material.to_vec(),
+            takeover: None,
         }
     }
 
     fn status(applied_revision: u64, routes: &[&str]) -> HostStatus {
         HostStatus {
+            leaving: false,
             applied_revision,
             instances: routes
                 .iter()
@@ -714,7 +1559,7 @@ mod tests {
             .unwrap();
         controller.unassign("rt-stopped-before-list");
         assert!(!controller.is_initialized());
-        assert!(controller.snapshot().is_none());
+        assert!(controller.snapshot(0).is_none());
         assert!(!revision.has_changed().unwrap());
 
         let baseline = controller.revision();
@@ -728,7 +1573,7 @@ mod tests {
             ),
             Ok(1)
         );
-        let snapshot = controller.snapshot().unwrap();
+        let snapshot = controller.snapshot(0).unwrap();
         assert_eq!(snapshot.revision, 1);
         assert_eq!(
             snapshot
@@ -773,7 +1618,7 @@ mod tests {
         );
         assert!(controller.assignment("rt-listed").is_none());
         assert_eq!(controller.replace_assignments(2, []), Ok(3));
-        assert!(controller.snapshot().unwrap().instances.is_empty());
+        assert!(controller.snapshot(0).unwrap().instances.is_empty());
 
         // The gateway refuses the assignment its host could not accept.
         let full =
@@ -802,6 +1647,7 @@ mod tests {
         let hello = |instance_id: &str, connection_epoch| HostHello {
             instance_id: instance_id.to_string(),
             connection_epoch,
+            member: None,
         };
         let (first, superseded) = controller
             .begin_session(identity.clone(), &hello("boot-1", 1))
@@ -849,5 +1695,497 @@ mod tests {
         assert!(controller.host_connected());
         controller.end_session(replacement);
         assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
+    }
+
+    fn member_hello(member: &str, process: &str, connection_epoch: u64) -> HostHello {
+        HostHello {
+            instance_id: process.to_string(),
+            connection_epoch,
+            member: Some(PoolMember {
+                member_id: member.to_string(),
+                member_uid: format!("uid-{member}"),
+                runtime_address: format!("10.0.0.{}:5500", member.len()),
+            }),
+        }
+    }
+
+    fn owner(member: &str, process: &str, auth_epoch: u64) -> InstanceOwner {
+        InstanceOwner {
+            member_id: member.to_string(),
+            process_id: process.to_string(),
+            auth_epoch,
+            supervisor_instance_id: (auth_epoch > 1).then(|| format!("instance-{auth_epoch}")),
+            takeover: (auth_epoch > 1).then(|| SandboxInstanceTakeover {
+                auth_epoch,
+                supervisor_instance_id: format!("instance-{auth_epoch}"),
+                grant: format!("grant-{auth_epoch}"),
+                ..SandboxInstanceTakeover::default()
+            }),
+        }
+    }
+
+    fn member_view(member: &str, process: &str) -> MemberView {
+        MemberView {
+            member_id: member.to_string(),
+            process_id: process.to_string(),
+            runtime_address: format!("10.0.0.{}:5500", member.len()),
+            leaving: false,
+        }
+    }
+
+    fn identity() -> HostIdentity {
+        HostIdentity {
+            subject: "openshell-supervisor:test".to_string(),
+            token_id: "token".to_string(),
+            expires_at: i64::MAX,
+        }
+    }
+
+    /// A pool view in which every owned route is desired and loaded.
+    fn loaded_view(
+        members: Vec<MemberView>,
+        owners: impl IntoIterator<Item = (&'static str, InstanceOwner)>,
+    ) -> PoolView {
+        let owners = owners
+            .into_iter()
+            .map(|(route, owner)| (route.to_string(), owner))
+            .collect::<BTreeMap<_, _>>();
+        PoolView {
+            members,
+            desired: owners.keys().cloned().collect(),
+            assignments: owners
+                .keys()
+                .map(|route| (route.clone(), assignment(route, route.as_bytes())))
+                .collect(),
+            owners,
+            reports: BTreeMap::new(),
+        }
+    }
+
+    fn routes(snapshot: &AssignmentSnapshot) -> Vec<&str> {
+        snapshot
+            .instances
+            .iter()
+            .map(|instance| instance.route.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn membership_changes_follow_member_streams_and_leaving() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(75);
+        let mut changes = controller.membership_changes();
+        changes.mark_unchanged();
+        let (first, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "a member attached");
+        changes.mark_unchanged();
+        // A newer stream of the same member supersedes the first.
+        let (second, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 2))
+            .unwrap();
+        assert!(changes.has_changed().unwrap(), "a member reconnected");
+        changes.mark_unchanged();
+        // Ending the superseded stream changes nothing anyone serves.
+        controller.end_session(first);
+        assert!(!changes.has_changed().unwrap());
+        let status = |leaving| HostStatus {
+            applied_revision: 0,
+            instances: Vec::new(),
+            leaving,
+        };
+        controller.record_status(second, status(false)).unwrap();
+        assert!(!changes.has_changed().unwrap(), "an ordinary report");
+        controller.record_status(second, status(true)).unwrap();
+        assert!(changes.has_changed().unwrap(), "the member is leaving");
+        changes.mark_unchanged();
+        controller.end_session(second);
+        assert!(changes.has_changed().unwrap(), "the member's stream ended");
+    }
+
+    #[tokio::test]
+    async fn pool_members_receive_only_what_their_process_owns() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(75);
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        let (two, _) = controller
+            .begin_session(identity(), &member_hello("m-2", "p2", 1))
+            .unwrap();
+        // Members coexist; nothing is authoritative before ownership loads,
+        // so a restarted gateway never makes a member release its instances.
+        assert!(controller.snapshot(one).is_none());
+        assert_eq!(controller.connected_members().len(), 2);
+
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [
+                    ("rt-a", owner("m1", "p1", 1)),
+                    ("rt-b", owner("m-2", "p2", 1)),
+                ],
+            ),
+            tokio::time::Instant::now(),
+        );
+        let first = controller.snapshot(one).unwrap();
+        assert!(first.pool);
+        // Every member offers its instances' runtimes the pool's deadline.
+        assert_eq!(
+            first.recovery_timeout,
+            Some(prost_types::Duration {
+                seconds: 75,
+                nanos: 0
+            })
+        );
+        assert_eq!(routes(&first), ["rt-a"]);
+        assert!(first.instances[0].takeover.is_none());
+        assert_eq!(routes(&controller.snapshot(two).unwrap()), ["rt-b"]);
+        // Every member can redirect runtimes to any instance's owner.
+        assert_eq!(
+            first
+                .route_directory
+                .iter()
+                .map(|entry| (entry.route.as_str(), entry.runtime_address.as_str()))
+                .collect::<Vec<_>>(),
+            [("rt-a", "10.0.0.2:5500"), ("rt-b", "10.0.0.3:5500")]
+        );
+
+        // A takeover moves rt-b to m1 with the new term's credentials; m2's
+        // snapshot omits it, which releases it without stopping it.
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [
+                    ("rt-a", owner("m1", "p1", 1)),
+                    ("rt-b", owner("m1", "p1", 2)),
+                ],
+            ),
+            tokio::time::Instant::now(),
+        );
+        let moved = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&moved), ["rt-a", "rt-b"]);
+        assert_eq!(
+            moved.instances[1]
+                .takeover
+                .as_ref()
+                .map(|takeover| takeover.auth_epoch),
+            Some(2)
+        );
+        let released = controller.snapshot(two).unwrap();
+        assert!(released.instances.is_empty());
+        assert!(released.stop_routes.is_empty());
+
+        // A term whose credentials another gateway replica minted still names
+        // its term, so a host that runs the instance for it keeps it.
+        let mut unminted = owner("m1", "p1", 2);
+        unminted.takeover = None;
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-a", owner("m1", "p1", 1)), ("rt-b", unminted)],
+            ),
+            tokio::time::Instant::now(),
+        );
+        let term = controller.snapshot(one).unwrap().instances[1]
+            .takeover
+            .clone()
+            .expect("takeover term");
+        assert_eq!(
+            (term.auth_epoch, term.supervisor_instance_id.as_str()),
+            (2, "instance-2")
+        );
+        assert!(term.grant.is_empty() && term.gateway_token.is_empty());
+
+        // Withdrawing an instance lists it for its owner, and only its owner,
+        // to stop, and for the gateway to remove its durable record.
+        controller.unassign("rt-a");
+        assert_eq!(controller.snapshot(one).unwrap().stop_routes, ["rt-a"]);
+        assert!(controller.snapshot(two).unwrap().stop_routes.is_empty());
+        assert!(controller.stopping_routes().contains("rt-a"));
+        assert_eq!(controller.pool_withdrawals(), ["rt-a"]);
+
+        // A restarted process of a member supersedes that member's stream
+        // only; it owns nothing until the gateway grants it a term.
+        let (restarted, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1-restarted", 1))
+            .unwrap();
+        assert!(controller.snapshot(one).is_none());
+        assert!(controller.snapshot(restarted).unwrap().instances.is_empty());
+        assert_eq!(
+            routes(&controller.snapshot(two).unwrap()),
+            Vec::<&str>::new()
+        );
+        // A delayed hello from an older connection of a member's current
+        // process is refused.
+        assert!(
+            controller
+                .begin_session(identity(), &member_hello("m-2", "p2", 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reports_count_only_for_the_term_their_stream_acknowledged() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        let members = || vec![member_view("m1", "p1"), member_view("m-2", "p2")];
+        let send = |owner: InstanceOwner| {
+            controller.update_pool(
+                loaded_view(members(), [("rt-a", owner)]),
+                tokio::time::Instant::now(),
+            );
+            let revision = controller.snapshot(one).unwrap().revision;
+            controller.record_sent(one, revision);
+            revision
+        };
+        let terms = || {
+            controller
+                .member_reports()
+                .into_iter()
+                .map(|report| (report.status.route, report.auth_epoch))
+                .collect::<Vec<_>>()
+        };
+        let first = send(owner("m1", "p1", 1));
+        controller
+            .record_status(one, status(first, &["rt-a"]))
+            .unwrap();
+        assert_eq!(terms(), [("rt-a".to_string(), 1)]);
+        // Another member takes rt-a over, then it returns to the same,
+        // still running process at a later term, before the process applied
+        // either snapshot.
+        send(owner("m-2", "p2", 2));
+        assert!(terms().is_empty());
+        let third = send(owner("m1", "p1", 3));
+        // Its status from term 1 still lists rt-a as ready; that is not term
+        // 3's readiness.
+        controller
+            .record_status(one, status(first, &["rt-a"]))
+            .unwrap();
+        assert!(terms().is_empty());
+        controller
+            .record_status(one, status(third, &["rt-a"]))
+            .unwrap();
+        assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+        // A later snapshot that repeats the term keeps it installed.
+        let later = send(owner("m1", "p1", 3));
+        assert!(later >= third);
+        assert_eq!(terms(), [("rt-a".to_string(), 3)]);
+    }
+
+    #[test]
+    fn pool_observations_follow_the_owning_process_through_a_takeover() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
+        let (two, _) = controller
+            .begin_session(identity(), &member_hello("m-2", "p2", 1))
+            .unwrap();
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        // An unplaced instance has no verdict.
+        assert_eq!(controller.observed("rt-b"), ObservedInstance::NoHost);
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-b", owner("m-2", "p2", 1))],
+            ),
+            tokio::time::Instant::now(),
+        );
+        let revision = controller.snapshot(two).unwrap().revision;
+        controller.record_sent(two, revision);
+        controller
+            .record_status(two, status(revision, &["rt-b"]))
+            .unwrap();
+        assert!(matches!(
+            controller.observed("rt-b"),
+            ObservedInstance::Reported(status) if status.ready
+        ));
+        // m1 reconciled before the takeover; it does not host rt-b, but that
+        // is not evidence against the instance.
+        controller.record_sent(one, revision);
+        controller
+            .record_status(one, status(revision, &[]))
+            .unwrap();
+
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "p1"), member_view("m-2", "p2")],
+                [("rt-b", owner("m1", "p1", 2))],
+            ),
+            tokio::time::Instant::now(),
+        );
+        // The new owner has not reconciled to the takeover yet.
+        assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
+        let takeover = controller.snapshot(one).unwrap().revision;
+        controller.record_sent(one, takeover);
+        controller
+            .record_status(one, status(takeover, &["rt-b"]))
+            .unwrap();
+        assert!(matches!(
+            controller.observed("rt-b"),
+            ObservedInstance::Reported(_)
+        ));
+        // Each stream's reports are offered for recording under the term it
+        // acknowledged: the new owner's under term 2, and the previous
+        // owner's, which has not applied its release yet, under term 1.
+        let mut reports = controller
+            .member_reports()
+            .into_iter()
+            .map(|report| {
+                (
+                    report.status.route,
+                    report.member_id,
+                    report.process_id,
+                    report.auth_epoch,
+                )
+            })
+            .collect::<Vec<_>>();
+        reports.sort();
+        assert_eq!(
+            reports,
+            [
+                ("rt-b".to_string(), "m-2".to_string(), "p2".to_string(), 1),
+                ("rt-b".to_string(), "m1".to_string(), "p1".to_string(), 2),
+            ]
+        );
+
+        // An owner process this gateway does not serve gives no verdict of
+        // its own; another replica's recorded report of the owner gives one.
+        let mut elsewhere = loaded_view(
+            vec![member_view("m1", "p1")],
+            [("rt-b", owner("m-3", "p3", 3))],
+        );
+        controller.update_pool(elsewhere.clone(), tokio::time::Instant::now());
+        assert_eq!(controller.observed("rt-b"), ObservedInstance::NoHost);
+        let mut recorded = status(0, &["rt-b"]).instances.remove(0);
+        recorded.ready = false;
+        elsewhere
+            .reports
+            .insert("rt-b".to_string(), recorded.clone());
+        controller.update_pool(elsewhere, tokio::time::Instant::now());
+        assert_eq!(
+            controller.observed("rt-b"),
+            ObservedInstance::Reported(recorded)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_views_keep_fresh_placements_and_owned_instances() {
+        let controller = SupervisorHostController::new();
+        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
+        let (one, _) = controller
+            .begin_session(identity(), &member_hello("m1", "p1", 1))
+            .unwrap();
+        // `loaded` routes carry material this replica read; the rest are
+        // desired and owned only.
+        let view = |owned: &[&'static str], loaded: &[&str]| {
+            let mut view = loaded_view(
+                vec![member_view("m1", "p1")],
+                owned.iter().map(|route| (*route, owner("m1", "p1", 1))),
+            );
+            view.assignments
+                .retain(|route, _| loaded.contains(&route.as_str()));
+            view
+        };
+        controller.update_pool(view(&["rt-a"], &["rt-a"]), tokio::time::Instant::now());
+
+        // A launch through this gateway places and assigns rt-b while a
+        // reconciliation pass that listed records before it runs; the pass's
+        // view must not release the new instance.
+        let listed_before_launch = tokio::time::Instant::now();
+        controller.place_owner("rt-b", owner("m1", "p1", 1));
+        controller.assign(assignment("rt-b", b"b")).unwrap();
+        controller.update_pool(view(&["rt-a"], &["rt-a"]), listed_before_launch);
+        assert_eq!(routes(&controller.snapshot(one).unwrap()), ["rt-a", "rt-b"]);
+        controller.update_pool(
+            view(&["rt-a", "rt-b"], &["rt-a", "rt-b"]),
+            tokio::time::Instant::now(),
+        );
+        assert_eq!(routes(&controller.snapshot(one).unwrap()), ["rt-a", "rt-b"]);
+
+        // An owned instance whose launch material this gateway has not loaded
+        // yet, such as one launched through another gateway, is kept as is.
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b"]),
+            tokio::time::Instant::now(),
+        );
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a", "rt-b"]);
+        assert_eq!(snapshot.keep_routes, ["rt-c"]);
+        assert!(
+            snapshot
+                .route_directory
+                .iter()
+                .any(|entry| entry.route == "rt-c")
+        );
+        // Once loaded, it is assigned.
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a", "rt-b", "rt-c"]);
+        assert!(snapshot.keep_routes.is_empty());
+
+        // A withdrawal here is stopped, not kept, and stays withdrawn over
+        // views that still list its record, until the record is gone.
+        controller.unassign("rt-b");
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(snapshot.stop_routes, ["rt-b"]);
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a", "rt-c"]);
+        assert_eq!(snapshot.stop_routes, ["rt-b"]);
+        controller.forget_withdrawal("rt-b");
+        assert!(controller.pool_withdrawals().is_empty());
+
+        // An instance withdrawn through another replica leaves the desired
+        // set while its owner record remains: its owner stops it.
+        let mut withdrawn_elsewhere = view(&["rt-a", "rt-c"], &["rt-a", "rt-c"]);
+        withdrawn_elsewhere.desired.remove("rt-c");
+        withdrawn_elsewhere.assignments.remove("rt-c");
+        controller.update_pool(withdrawn_elsewhere, tokio::time::Instant::now());
+        let snapshot = controller.snapshot(one).unwrap();
+        assert_eq!(routes(&snapshot), ["rt-a"]);
+        assert_eq!(snapshot.stop_routes, ["rt-b", "rt-c"]);
+        assert!(snapshot.keep_routes.is_empty());
+
+        // An instance desired again is no longer stopped.
+        controller.update_pool(
+            view(&["rt-a", "rt-b", "rt-c"], &["rt-a", "rt-b", "rt-c"]),
+            tokio::time::Instant::now(),
+        );
+        assert!(controller.snapshot(one).unwrap().stop_routes.is_empty());
+        assert!(controller.stopping_routes().is_empty());
+    }
+
+    #[test]
+    fn pool_member_identities_must_be_complete() {
+        let member = member_hello("m1", "p1", 1).member.unwrap();
+        assert!(valid_member(&member));
+        for broken in [
+            PoolMember {
+                member_id: String::new(),
+                ..member.clone()
+            },
+            PoolMember {
+                member_uid: "uid with space".to_string(),
+                ..member.clone()
+            },
+            PoolMember {
+                runtime_address: "not-an-address".to_string(),
+                ..member
+            },
+        ] {
+            assert!(!valid_member(&broken));
+        }
     }
 }

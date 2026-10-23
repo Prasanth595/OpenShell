@@ -388,6 +388,94 @@ app.kubernetes.io/component: supervisor
 {{- end }}
 
 {{/*
+A chart value as a whole number, or nothing when it is not one. Helm parses
+YAML numbers as float64, so whole floats count; booleans, strings, and
+fractions do not.
+*/}}
+{{- define "openshell.wholeNumber" -}}
+{{- if has (kindOf .) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") -}}
+{{- $whole := int64 . -}}
+{{- if eq (float64 .) (float64 $whole) -}}{{- $whole -}}{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Shared supervisor replica count. A missing value (for example after `helm
+upgrade --reuse-values` from a release that predates it) means 1.
+*/}}
+{{- define "openshell.supervisorReplicas" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "replicas" -}}
+{{- if or (not (hasKey $supervisor "replicas")) (kindIs "invalid" $value) -}}
+1
+{{- else -}}
+{{- $replicas := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $replicas "") (lt (int64 $replicas) 1) -}}
+{{- fail "supervisor.replicas must be an integer of at least 1" -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+"true" when the shared supervisor runs as a high-availability pool, else
+nothing. supervisor.highAvailability selects the pool at any replica count,
+including one, so the count can later change without changing the gateway
+configuration or the supervisor Pod template; two or more replicas always
+form a pool. Every pool-dependent resource reads this helper.
+*/}}
+{{- define "openshell.supervisorPool" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "highAvailability" -}}
+{{- if and (hasKey $supervisor "highAvailability") (not (kindIs "invalid" $value)) (not (kindIs "bool" $value)) -}}
+{{- fail "supervisor.highAvailability must be true or false" -}}
+{{- end -}}
+{{- if or (and (kindIs "bool" $value) $value) (gt (int64 (include "openshell.supervisorReplicas" .)) 1) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Seconds a sandbox runtime keeps its workload frozen after losing a pool
+member's supervision, or nothing when unset so the gateway applies its pool
+default.
+*/}}
+{{- define "openshell.supervisorRecoveryTimeoutSeconds" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "recoveryTimeoutSeconds" -}}
+{{- if and (hasKey $supervisor "recoveryTimeoutSeconds") (not (kindIs "invalid" $value)) (ne (toString $value) "") -}}
+{{- $timeout := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $timeout "") (lt (int64 $timeout) 10) (gt (int64 $timeout) 300) -}}
+{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default" -}}
+{{- end -}}
+{{- $timeout -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The gateway's [openshell.gateway.supervisor_pool] table as YAML, or nothing.
+The chart owns it: a high-availability pool (openshell.supervisorPool) is one
+the gateway coordinates, and the table does not depend on the replica count.
+A single shared supervisor renders no table, so its gateway configuration is
+unchanged. Validates the supervisor values whenever the gateway topology is
+selected, and refuses a hand-written table in either TOML form.
+*/}}
+{{- define "openshell.supervisorPoolConfig" -}}
+{{- $gatewayConfig := .Values.gatewayConfig | default dict -}}
+{{- if or (hasKey $gatewayConfig "openshell.gateway.supervisor_pool") (hasKey (get $gatewayConfig "openshell.gateway" | default dict) "supervisor_pool") -}}
+{{- fail "supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds" -}}
+{{- end -}}
+{{- if include "openshell.supervisorEnabled" . -}}
+{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
+{{- if include "openshell.supervisorPool" . -}}
+{{- $pool := dict "enabled" true -}}
+{{- if $recoveryTimeout -}}
+{{- $_ := set $pool "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
+{{- end -}}
+{{- toYaml $pool -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Namespace selector for the sandbox namespaces of this gateway's workspace
 mode: the shared namespace, the managed namespaces it labels, or the
 operator-labeled namespaces.
@@ -654,6 +742,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}
 {{- end -}}
+{{- $_ := include "openshell.supervisorPoolConfig" . -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}
